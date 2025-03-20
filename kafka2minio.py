@@ -264,44 +264,33 @@ class KafkaToMinioProcessor:
         try:
             # Ana mesaj işleme döngüsü
             consecutive_errors = 0
+            processed_count = 0
             
             for message in self.consumer:
                 if not self.running:
                     break
                 
                 try:
-                    # Mesajı JSON olarak alıp içeriğini işle
-                    # Not: Bu kısım veri yapınıza göre özelleştirilmelidir
-                    record = message.value
+                    # Mesajı işle
+                    record = self._process_message(message)
                     
-                    # Eğer timestamp formatı farklıysa, burada düzeltmeler yapabilirsiniz
-                    if 'timestamp' in record and isinstance(record['timestamp'], str):
-                        try:
-                            # Örnek: "2023-06-01T12:34:56.789Z" formatını datetime'a çevir
-                            timestamp_str = record['timestamp']
-                            # ISO format denemesi
-                            try:
-                                parsed_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                                record['timestamp'] = parsed_time.isoformat()
-                            except ValueError:
-                                # Unix timestamp (milisaniye) denemesi
-                                if timestamp_str.isdigit():
-                                    timestamp_ms = int(timestamp_str)
-                                    parsed_time = datetime.fromtimestamp(timestamp_ms / 1000.0)
-                                    record['timestamp'] = parsed_time.isoformat()
-                        except Exception as e:
-                            logger.warning(f"Timestamp dönüştürme hatası: {e}, orijinal değer korunuyor")
-                    
-                    # Mesajı tampon belleğe ekle
-                    with self.buffer_lock:
-                        self.buffer.append(record)
-                    
-                    # Tampon boyutu kontrol et
-                    if len(self.buffer) >= BATCH_SIZE:
-                        self._flush_buffer()
-                    
-                    # Başarılı işlem sonrası hata sayacını sıfırla
-                    consecutive_errors = 0
+                    if record is not None:
+                        # Mesajı tampon belleğe ekle
+                        with self.buffer_lock:
+                            self.buffer.append(record)
+                        
+                        processed_count += 1
+                        if processed_count % 1000 == 0:
+                            logger.info(f"{processed_count} mesaj işlendi")
+                        
+                        # Tampon boyutu kontrol et
+                        if len(self.buffer) >= BATCH_SIZE:
+                            self._flush_buffer()
+                        
+                        # Başarılı işlem sonrası hata sayacını sıfırla
+                        consecutive_errors = 0
+                    else:
+                        logger.warning("Mesaj işlenemedi ve atlandı")
                         
                 except Exception as e:
                     logger.error(f"Mesaj işleme hatası: {e}, mesaj: {message}")
@@ -365,33 +354,55 @@ class KafkaToMinioProcessor:
             current_data = self.buffer.copy()
             self.buffer = []
         
-        # Verileri dataframe'e dönüştür
-        df = pd.DataFrame(current_data)
+        try:
+            # Verileri dataframe'e dönüştür
+            df = pd.DataFrame(current_data)
+            
+            # Zaman damgasını datetime'a dönüştür
+            if 'timestamp' in df.columns:
+                if df['timestamp'].dtype == 'object':
+                    try:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    except Exception as e:
+                        logger.warning(f"Dataframe timestamp dönüştürme hatası: {e}")
+                        # Farklı bir yaklaşım dene
+                        try:
+                            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+                        except:
+                            logger.warning("ISO8601 formatı ile dönüştürme başarısız")
+                            # Son bir deneme daha
+                            try:
+                                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                                # NaT değerlerini şu anki zamanla doldur
+                                df['timestamp'] = df['timestamp'].fillna(pd.Timestamp.now())
+                            except:
+                                logger.error("Timestamp dönüştürülemedi, işleme devam edilemiyor")
+                                return
+            else:
+                # Timestamp kolonu yoksa şu anki zamanı ekle
+                df['timestamp'] = pd.Timestamp.now()
+            
+            # Tarih, saat ve dakika kolonları ekle - partition için kullanılacak
+            df['date'] = df['timestamp'].dt.date
+            df['hour'] = df['timestamp'].dt.hour
+            df['minute'] = df['timestamp'].dt.minute
+            
+            # Tarih/saat/dakika bazında grupla ve her birim için bir Parquet dosyası oluştur
+            for date_group, date_df in df.groupby('date'):
+                for hour_group, hour_df in date_df.groupby('hour'):
+                    for minute_group, minute_df in hour_df.groupby('minute'):
+                        # Partition dizin yapısı oluştur: data/date=YYYY-MM-DD/hour=HH/minute=MM/
+                        self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
+            
+            logger.info(f"{len(current_data)} mesaj işlendi ve dakikalık partitionlara bölünerek Minio'ya yazıldı")
         
-        # Zaman damgasını datetime'a dönüştür (veri formatına bağlı olarak ayarla)
-        if 'timestamp' in df.columns:
-            if df['timestamp'].dtype == 'object':
-                try:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                except Exception as e:
-                    logger.warning(f"Zaman damgası dönüştürme hatası: {e}")
-        else:
-            # Timestamp kolonu yoksa şu anki zamanı ekle
-            df['timestamp'] = datetime.now()
-        
-        # Tarih, saat ve dakika kolonları ekle - partition için kullanılacak
-        df['date'] = df['timestamp'].dt.date
-        df['hour'] = df['timestamp'].dt.hour
-        df['minute'] = df['timestamp'].dt.minute
-        
-        # Tarih/saat/dakika bazında grupla ve her birim için bir Parquet dosyası oluştur
-        for date_group, date_df in df.groupby('date'):
-            for hour_group, hour_df in date_df.groupby('hour'):
-                for minute_group, minute_df in hour_df.groupby('minute'):
-                    # Partition dizin yapısı oluştur: data/date=YYYY-MM-DD/hour=HH/minute=MM/
-                    self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
-        
-        logger.info(f"{len(current_data)} mesaj işlendi ve dakikalık partitionlara bölünerek Minio'ya yazıldı")
+        except Exception as e:
+            logger.error(f"Buffer flush hatası: {e}")
+            # Hatada bile verileri kaybetmemek için tampona geri koy
+            with self.buffer_lock:
+                self.buffer.extend(current_data)
+            # Kısa bir süre bekle ve tekrar dene
+            time.sleep(5)
     
     def _write_parquet_to_minio(self, df, date, hour, minute):
         """
