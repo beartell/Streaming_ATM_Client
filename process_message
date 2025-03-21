@@ -1,0 +1,57 @@
+def _process_message(self, message):
+    """
+    Kafka'dan gelen JSON formatındaki ATM log mesajını işler.
+    
+    Args:
+        message: Kafka'dan gelen ham mesaj
+        
+    Returns:
+        İşlenmiş kayıt (dictionary) veya işleme hatası durumunda None
+    """
+    try:
+        # Gelen mesajın kendisi zaten JSON
+        record = message.value
+        
+        # message alanı da ayrı bir JSON string olabilir, bunu da ayrıştıralım
+        if 'message' in record and isinstance(record['message'], str):
+            try:
+                # İç message'ı da JSON olarak ayrıştır
+                inner_message = json.loads(record['message'])
+                
+                # İç mesajı ana kayda ekle (opsiyonel)
+                record['parsed_message'] = inner_message
+                
+                # Timestamp alanlarını standartlaştır
+                if '@timestamp' in record:
+                    # Ana timestamp'i kullan
+                    timestamp_str = record['@timestamp']
+                    record['timestamp'] = timestamp_str
+                elif 'transaction' in inner_message and 'timestamp' in inner_message['transaction']:
+                    # İç mesajdaki timestamp'i kullan
+                    timestamp_str = inner_message['transaction']['timestamp']
+                    record['timestamp'] = timestamp_str
+                else:
+                    # Geçerli zamanı kullan
+                    record['timestamp'] = datetime.now().isoformat() + 'Z'
+            except json.JSONDecodeError as e:
+                logger.warning(f"İç mesaj JSON ayrıştırma hatası: {e}. Orijinal mesaj korunuyor.")
+                # timestamp yoksa ekle
+                if '@timestamp' in record:
+                    record['timestamp'] = record['@timestamp']
+                else:
+                    record['timestamp'] = datetime.now().isoformat() + 'Z'
+        elif '@timestamp' in record:
+            # message alanı yoksa ama @timestamp varsa
+            record['timestamp'] = record['@timestamp']
+        else:
+            # Hiçbir timestamp alanı yoksa
+            record['timestamp'] = datetime.now().isoformat() + 'Z'
+        
+        # Veriyi düzleştir (opsiyonel, büyük iç içe yapılar için faydalı olabilir)
+        # Bu adımı ihtiyaca göre etkinleştirebilirsiniz
+        # record = self._flatten_record(record)
+        
+        return record
+    except Exception as e:
+        logger.error(f"Mesaj işleme hatası: {e}")
+        return None
