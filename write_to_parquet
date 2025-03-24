@@ -1,0 +1,43 @@
+def _write_parquet_to_minio(self, df, date, hour, minute):
+    """
+    DataFrame'i Parquet formatında Minio'ya yaz.
+    
+    Args:
+        df: Yazılacak pandas DataFrame
+        date: Tarih (partition için)
+        hour: Saat (partition için)
+        minute: Dakika (partition için)
+    """
+    try:
+        # DataFrame'den gereksiz partition kolonlarını çıkar (opsiyonel)
+        if 'date' in df.columns and 'hour' in df.columns and 'minute' in df.columns:
+            df = df.drop(['date', 'hour', 'minute'], axis=1)
+        
+        # Tüm kolonları string tipine dönüştür
+        for col in df.columns:
+            df[col] = df[col].fillna('').astype(str)
+        
+        # Geçici dosya oluştur
+        with tempfile.NamedTemporaryFile(suffix='.parquet') as temp_file:
+            # DataFrame'i Parquet olarak yaz
+            table = pa.Table.from_pandas(df)
+            pq.write_table(
+                table, 
+                temp_file.name,
+                compression="snappy"  # Değişken yerine doğrudan string
+            )
+            
+            # Minio'ya yükle
+            date_str = date.strftime("%Y-%m-%d")
+            object_name = f"data/date={date_str}/hour={hour:02d}/minute={minute:02d}/{uuid.uuid4()}.parquet"
+            
+            self.minio_client.fput_object(
+                MINIO_BUCKET,
+                object_name,
+                temp_file.name
+            )
+            
+            logger.info(f"Parquet dosyası yazıldı: {object_name}, {len(df)} satır")
+            
+    except Exception as e:
+        logger.error(f"Parquet yazma hatası: {e}")
