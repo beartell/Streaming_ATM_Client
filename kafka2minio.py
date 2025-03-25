@@ -431,111 +431,138 @@ class KafkaToMinioProcessor:
             # CPU kullanımını azaltmak için kısa bir uyku
             time.sleep(1)
 
-    def _flush_buffer(self):
-        """Tampondaki verileri Minio'ya Parquet formatında yaz."""
-        with self.buffer_lock:
-            if not self.buffer:
-                return
+   def _flush_buffer(self):
+       """Tampondaki verileri Minio'ya Parquet formatında yaz."""
+       with self.buffer_lock:
+           if not self.buffer:
+               return
+   
+           # Tampondaki verileri kopyala, ama henüz tamponu temizleme
+           # Başarılı yazma işleminden sonra tamponu temizleyeceğiz
+           current_data = self.buffer.copy()
+   
+       try:
+           # Verileri dataframe'e dönüştür
+           df = pd.DataFrame(current_data)
+   
+           # Zaman damgasını datetime'a dönüştür
+           if 'timestamp' in df.columns:
+               if df['timestamp'].dtype == 'object':
+                   try:
+                       df['timestamp'] = pd.to_datetime(df['timestamp'])
+                   except Exception as e:
+                       logger.warning(f"Dataframe timestamp dönüştürme hatası: {e}")
+                       # Farklı bir yaklaşım dene
+                       try:
+                           df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+                       except:
+                           logger.warning("ISO8601 formatı ile dönüştürme başarısız")
+                           # Son bir deneme daha
+                           try:
+                               df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                               # NaT değerlerini şu anki zamanla doldur
+                               df['timestamp'] = df['timestamp'].fillna(pd.Timestamp.now())
+                           except:
+                               logger.error("Timestamp dönüştürülemedi, işleme devam edilemiyor")
+                               return
+           else:
+               # Timestamp kolonu yoksa şu anki zamanı ekle
+               df['timestamp'] = pd.Timestamp.now()
+           
+           # Datetime timestamp'i "YYYY-MM-DD HH:MM:SS" formatında string'e dönüştür
+           df['timestamp_str'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+           
+           # Eğer @timestamp alanı varsa, onu da dönüştür
+           if '@timestamp' in df.columns:
+               try:
+                   # Önce datetime'a çevir
+                   df['@timestamp'] = pd.to_datetime(df['@timestamp'], errors='coerce')
+                   # String formatına dönüştür
+                   df['@timestamp_str'] = df['@timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                   # NaN değerleri boş string ile değiştir
+                   df['@timestamp_str'] = df['@timestamp_str'].fillna('')
+               except Exception as e:
+                   logger.warning(f"@timestamp dönüştürme hatası: {e}")
+   
+           # Tarih, saat ve dakika kolonları ekle - partition için kullanılacak
+           df['date'] = df['timestamp'].dt.date
+           df['hour'] = df['timestamp'].dt.hour
+           df['minute'] = df['timestamp'].dt.minute
+   
+           # Tarih/saat/dakika bazında grupla ve her birim için bir Parquet dosyası oluştur
+           for date_group, date_df in df.groupby('date'):
+               for hour_group, hour_df in date_df.groupby('hour'):
+                   for minute_group, minute_df in hour_df.groupby('minute'):
+                       # Partition dizin yapısı oluştur: data/date=YYYY-MM-DD/hour=HH/minute=MM/
+                       self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
+   
+           logger.info(f"{len(current_data)} mesaj işlendi ve dakikalık partitionlara bölünerek Minio'ya yazıldı")
+           
+           # Başarılı yazma sonrası tamponu temizle
+           with self.buffer_lock:
+               # current_data içindeki tüm kayıtları buffer'dan çıkar
+               # buffer'da başka thread'ler tarafından eklenen yeni kayıtlar olabilir
+               # dolayısıyla buffer = [] yapmak yerine, bildiğimiz kayıtları çıkarıyoruz
+               if current_data:
+                   # İşlenmiş kayıtları tamponda ara ve çıkar
+                   ids_to_remove = set(id(item) for item in current_data)
+                   self.buffer = [item for item in self.buffer if id(item) not in ids_to_remove]
+                   
+       except Exception as e:
+           logger.error(f"Buffer flush hatası: {e}")
+           # Hatada bile verileri kaybetmemek için tampona geri koy
+           # Buffer'ı baştan temizlemediğimiz için burada eklemeye gerek yok
+           
+           # Kritik hata durumunda yeniden deneme
+           retry_count = 0
+           while retry_count < MAX_RETRY_ATTEMPTS - 1:  # Bir deneme zaten yapıldı
+               retry_count += 1
+               logger.warning(f"Buffer flush yeniden deneniyor. Deneme {retry_count+1}/{MAX_RETRY_ATTEMPTS}")
+               time.sleep(5)  # Beş saniye bekle
+               try:
+                   # Batch'i daha küçük parçalara bölelim
+                   chunk_size = len(current_data) // 2
+                   if chunk_size < 10:  # Çok küçük parçalara bölme
+                       chunk_size = 10
+                   
+                   # Daha küçük parçalar halinde yazma işlemi
+                   for i in range(0, len(current_data), chunk_size):
+                       chunk = current_data[i:i+chunk_size]
+                       chunk_df = pd.DataFrame(chunk)
+                       if 'timestamp' in chunk_df.columns:
+                           chunk_df['timestamp'] = pd.to_datetime(chunk_df['timestamp'], errors='coerce')
+                           # String formatına dönüştür
+                           chunk_df['timestamp_str'] = chunk_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                           
+                           # Eğer @timestamp alanı varsa, onu da dönüştür
+                           if '@timestamp' in chunk_df.columns:
+                               try:
+                                   chunk_df['@timestamp'] = pd.to_datetime(chunk_df['@timestamp'], errors='coerce')
+                                   chunk_df['@timestamp_str'] = chunk_df['@timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                                   chunk_df['@timestamp_str'] = chunk_df['@timestamp_str'].fillna('')
+                               except Exception as e_ts:
+                                   logger.warning(f"Chunk @timestamp dönüştürme hatası: {e_ts}")
+                           
+                           chunk_df['date'] = chunk_df['timestamp'].dt.date
+                           chunk_df['hour'] = chunk_df['timestamp'].dt.hour
+                           chunk_df['minute'] = chunk_df['timestamp'].dt.minute
+                           
+                           for date_group, date_df in chunk_df.groupby('date'):
+                               for hour_group, hour_df in date_df.groupby('hour'):
+                                   for minute_group, minute_df in hour_df.groupby('minute'):
+                                       self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
+                   
+                   logger.info(f"Parçalı yazma başarılı oldu. {len(current_data)} kayıt işlendi.")
+                   
+                   # Başarılı yazma sonrası tamponu güncelle
+                   with self.buffer_lock:
+                       ids_to_remove = set(id(item) for item in current_data)
+                       self.buffer = [item for item in self.buffer if id(item) not in ids_to_remove]
+                   break  # Başarılı oldu, döngüden çık
+               except Exception as e2:
+                   logger.error(f"Parçalı yazma denemesi başarısız: {e2}")
 
-            # Tampondaki verileri kopyala, ama henüz tamponu temizleme
-            # Başarılı yazma işleminden sonra tamponu temizleyeceğiz
-            current_data = self.buffer.copy()
-
-        try:
-            # Verileri dataframe'e dönüştür
-            df = pd.DataFrame(current_data)
-
-            # Zaman damgasını datetime'a dönüştür
-            if 'timestamp' in df.columns:
-                if df['timestamp'].dtype == 'object':
-                    try:
-                        df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    except Exception as e:
-                        logger.warning(f"Dataframe timestamp dönüştürme hatası: {e}")
-                        # Farklı bir yaklaşım dene
-                        try:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
-                        except:
-                            logger.warning("ISO8601 formatı ile dönüştürme başarısız")
-                            # Son bir deneme daha
-                            try:
-                                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-                                # NaT değerlerini şu anki zamanla doldur
-                                df['timestamp'] = df['timestamp'].fillna(pd.Timestamp.now())
-                            except:
-                                logger.error("Timestamp dönüştürülemedi, işleme devam edilemiyor")
-                                return
-            else:
-                # Timestamp kolonu yoksa şu anki zamanı ekle
-                df['timestamp'] = pd.Timestamp.now()
-
-            # Tarih, saat ve dakika kolonları ekle - partition için kullanılacak
-            df['date'] = df['timestamp'].dt.date
-            df['hour'] = df['timestamp'].dt.hour
-            df['minute'] = df['timestamp'].dt.minute
-
-            # Tarih/saat/dakika bazında grupla ve her birim için bir Parquet dosyası oluştur
-            for date_group, date_df in df.groupby('date'):
-                for hour_group, hour_df in date_df.groupby('hour'):
-                    for minute_group, minute_df in hour_df.groupby('minute'):
-                        # Partition dizin yapısı oluştur: data/date=YYYY-MM-DD/hour=HH/minute=MM/
-                        self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
-
-            logger.info(f"{len(current_data)} mesaj işlendi ve dakikalık partitionlara bölünerek Minio'ya yazıldı")
-            
-            # Başarılı yazma sonrası tamponu temizle
-            with self.buffer_lock:
-                # current_data içindeki tüm kayıtları buffer'dan çıkar
-                # buffer'da başka thread'ler tarafından eklenen yeni kayıtlar olabilir
-                # dolayısıyla buffer = [] yapmak yerine, bildiğimiz kayıtları çıkarıyoruz
-                if current_data:
-                    # İşlenmiş kayıtları tamponda ara ve çıkar
-                    ids_to_remove = set(id(item) for item in current_data)
-                    self.buffer = [item for item in self.buffer if id(item) not in ids_to_remove]
-                    
-        except Exception as e:
-            logger.error(f"Buffer flush hatası: {e}")
-            # Hatada bile verileri kaybetmemek için tampona geri koy
-            # Buffer'ı baştan temizlemediğimiz için burada eklemeye gerek yok
-            
-            # Kritik hata durumunda yeniden deneme
-            retry_count = 0
-            while retry_count < MAX_RETRY_ATTEMPTS - 1:  # Bir deneme zaten yapıldı
-                retry_count += 1
-                logger.warning(f"Buffer flush yeniden deneniyor. Deneme {retry_count+1}/{MAX_RETRY_ATTEMPTS}")
-                time.sleep(5)  # Beş saniye bekle
-                try:
-                    # Batch'i daha küçük parçalara bölelim
-                    chunk_size = len(current_data) // 2
-                    if chunk_size < 10:  # Çok küçük parçalara bölme
-                        chunk_size = 10
-                    
-                    # Daha küçük parçalar halinde yazma işlemi
-                    for i in range(0, len(current_data), chunk_size):
-                        chunk = current_data[i:i+chunk_size]
-                        chunk_df = pd.DataFrame(chunk)
-                        if 'timestamp' in chunk_df.columns:
-                            chunk_df['timestamp'] = pd.to_datetime(chunk_df['timestamp'], errors='coerce')
-                            chunk_df['date'] = chunk_df['timestamp'].dt.date
-                            chunk_df['hour'] = chunk_df['timestamp'].dt.hour
-                            chunk_df['minute'] = chunk_df['timestamp'].dt.minute
-                            
-                            for date_group, date_df in chunk_df.groupby('date'):
-                                for hour_group, hour_df in date_df.groupby('hour'):
-                                    for minute_group, minute_df in hour_df.groupby('minute'):
-                                        self._write_parquet_to_minio(minute_df, date_group, hour_group, minute_group)
-                    
-                    logger.info(f"Parçalı yazma başarılı oldu. {len(current_data)} kayıt işlendi.")
-                    
-                    # Başarılı yazma sonrası tamponu güncelle
-                    with self.buffer_lock:
-                        ids_to_remove = set(id(item) for item in current_data)
-                        self.buffer = [item for item in self.buffer if id(item) not in ids_to_remove]
-                    break  # Başarılı oldu, döngüden çık
-                except Exception as e2:
-                    logger.error(f"Parçalı yazma denemesi başarısız: {e2}")
-
-    def _write_parquet_to_minio(self, df, date, hour, minute):
+   def _write_parquet_to_minio(self, df, date, hour, minute):
         """Parquet dosyasını oluştur ve Minio'ya yükle."""
         # Başarı durumunu izlemek için değişken
         success = False
