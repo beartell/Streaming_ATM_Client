@@ -20,6 +20,7 @@ import ssl
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import signal
+import sys
 
 from kafka import KafkaConsumer
 from minio import Minio
@@ -28,6 +29,10 @@ from minio.error import S3Error
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from pyarrow import flight
+from pyarrow.flight import FlightClient
+import requests
 
 # JKS (Java KeyStore) dosyalarını okumak için gerekli kütüphane 
 # pip install pyjks cryptography
@@ -80,10 +85,45 @@ PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "snappy")  # snappy, gzip
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))  # Maksimum yeniden deneme sayısı
 
 
+
+
+LOCATION = "grpc://10.240.48.99:32010"
+URI = "http://10.240.48.99:9047/apiv2/login"
+USERNAME = "admin"
+PASSWORD = "Hedelek123."
+
+def get_token(uri=URI, username=USERNAME, password=PASSWORD):
+    """Retrieve PAT Token from Dremio."""
+    payload = {"userName": username, "password": password}
+    try:
+        response = requests.post(uri, json=payload)
+        response.raise_for_status()
+        return response.json().get("token")
+    except requests.exceptions.RequestException as e:
+        print(f"Error obtaining token: {e}")
+        return None
+
+def setup_client(location=LOCATION, token=None):
+    """Set up Arrow Flight client with authorization headers."""
+    client = FlightClient(location=location, disable_server_verification=False)
+    headers = [(b"authorization", f"bearer {token}".encode("utf-8"))] if token else []
+    return client, headers
+
+def execute_query(client, query, headers):
+    """Execute a query using Arrow Flight Client."""
+    try:
+        options = flight.FlightCallOptions(headers=headers)
+        flight_info = client.get_flight_info(flight.FlightDescriptor.for_command(query), options)
+        results = client.do_get(flight_info.endpoints[0].ticket, options)
+        return results.read_all()
+    except Exception as e:
+        print(f"Error executing query: {e}")
+        return None
+
 class KafkaToMinioProcessor:
     """Kafka'dan veri tüketen ve Minio'ya Parquet formatında yazan sınıf."""
 
-    def __init__(self):
+    def __init__(self, client, headers):
         """İşlemci nesnesini başlat ve bağlantıları kur."""
         self.consumer = None
         self.minio_client = None
@@ -94,6 +134,8 @@ class KafkaToMinioProcessor:
         self.flush_thread = None
         self.temp_ssl_files = []
         self.shutdown_event = threading.Event()
+        self.client = client
+        self.headers = headers
         
         # Sinyal işleyicilerini ayarla
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -431,7 +473,7 @@ class KafkaToMinioProcessor:
             # CPU kullanımını azaltmak için kısa bir uyku
             time.sleep(1)
 
-   def _flush_buffer(self):
+    def _flush_buffer(self):
        """Tampondaki verileri Minio'ya Parquet formatında yaz."""
        with self.buffer_lock:
            if not self.buffer:
@@ -561,8 +603,25 @@ class KafkaToMinioProcessor:
                    break  # Başarılı oldu, döngüden çık
                except Exception as e2:
                    logger.error(f"Parçalı yazma denemesi başarısız: {e2}")
+    
+    def copy_parquet_to_dremio(self, object_name):
+        """COPY Parquet file into Dremio table."""
+        start_time = time.time()
+        try:
+            sql_copy = f"""
+            COPY INTO MINIO.vendor3.data.senaryo_1_par
+            FROM '@MINIO.vendor3.{object_name}'
+            FILE_FORMAT 'parquet';
+            """
+            execute_query(self.client, sql_copy, self.headers)
+            elapsed_time = time.time() - start_time
+            print(f"Parquet files copied into Dremio table in {elapsed_time:.2f} seconds.")
+            return elapsed_time
+        except Exception as e:
+            print(f"Error copying Parquet files from {s3_folder} to Dremio: {e}")
+            sys.exit(1)    
 
-   def _write_parquet_to_minio(self, df, date, hour, minute):
+    def _write_parquet_to_minio(self, df, date, hour, minute):
         """Parquet dosyasını oluştur ve Minio'ya yükle."""
         # Başarı durumunu izlemek için değişken
         success = False
@@ -605,9 +664,10 @@ class KafkaToMinioProcessor:
                 )
                 
                 # Minio'ya yükleme
-                date_str = date.strftime("%Y-%m-%d")
-                object_name = f"data/date={date_str}/hour={hour:02d}/minute={minute:02d}/{uuid.uuid4()}.parquet"
-                
+                #date_str = date.strftime("%Y-%m-%d")
+                #object_name = f"data/date={date_str}/hour={hour:02d}/minute={minute:02d}/{uuid.uuid4()}.parquet"
+                object_name = f"data/{uuid.uuid4()}.parquet"
+
                 # Yeniden deneme mekanizması
                 retry_count = 0
                 while retry_count < MAX_RETRY_ATTEMPTS:
@@ -618,6 +678,7 @@ class KafkaToMinioProcessor:
                             temp_file_path
                         )
                         logger.info(f"Parquet dosyası yazıldı: {object_name}, {len(df)} satır")
+                        self.copy_parquet_to_dremio(object_name)
                         success = True
                         break  # Başarılı oldu, döngüden çık
                     except Exception as e:
@@ -654,7 +715,15 @@ def main():
     logger.info("Kafka to Minio veri akış uygulaması başlatılıyor")
     logger.info(f"Yapılandırma: KAFKA_TOPIC={KAFKA_TOPIC}, MINIO_BUCKET={MINIO_BUCKET}")
 
-    processor = KafkaToMinioProcessor()
+    token = get_token()
+    if not token:
+        print("Failed to authenticate with Dremio.")
+        sys.exit(1)
+
+    # Set up Arrow Flight client with headers
+    client, headers = setup_client(token=token)
+
+    processor = KafkaToMinioProcessor(client, headers)
 
     try:
         processor.connect_kafka()
