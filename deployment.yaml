@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-to-minio-config
+data:
+  MINIO_ENDPOINT: "10.240.49.15:9000"
+  MINIO_BUCKET: "vendor3"
+  SECURE: "False"
+  KAFKA_BOOTSTRAP_SERVERS: "lkfkkonp01.aknet.akb:9093,lkfkkonp02.aknet.akb:9093,lkfkkonp03.aknet.akb:9093"
+  KAFKA_TOPIC: "atmclientlog"
+  KAFKA_GROUP_ID: "aatm-data-logs-ultra"
+  KAFKA_AUTO_OFFSET_RESET: "earliest"
+  KAFKA_SECURITY_PROTOCOL: "SSL"
+  KAFKA_SSL_CHECK_HOSTNAME: "False"
+  KAFKA_SSL_TRUSTSTORE_LOCATION: "/tmp/Kafka_Connection/kafka.broker.truststore.jks"
+  BATCH_SIZE: "10000"
+  FLUSH_INTERVAL: "1020"
+  ERROR_TOLERANCE: "5"
+  PARQUET_COMPRESSION: "snappy"
+  MAX_RETRY_ATTEMPTS: "3"
+  LOCATION: "grpc://10.240.48.99:31898"
+  URI: "http://10.240.48.99:31248/apiv2/login"
+  USERNAME: "admin"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-to-minio-secrets
+type: Opaque
+data:
+  MINIO_ACCESS_KEY: eE9wazdTTkRPZENjUFB1a1FSSWg=  # base64 encoded "xOpk7SNDOdCcPPukQRIh"
+  MINIO_SECRET_KEY: a2xmeUpSR3E2eGQ3RUpwaUJlWFV5ZmJ5eHYyZHNuaDE4ZnpJWm9EYQ==  # base64 encoded "klfyJRGq6xd7EJpiBeXUyfbyxv2dsnh18fzIZoDa"
+  KAFKA_SSL_TRUSTSTORE_PASSWORD: RC1CbzJQNEU1dn5s  # base64 encoded "D-Bo2P4E5v~l"
+  KAFKA_SSL_KEY_PASSWORD: RC1CbzJQNEU1dn5s  # base64 encoded "D-Bo2P4E5v~l"
+  PASSWORD: YWRtaW5hZG1pbjIwMjU=  # base64 encoded "adminadmin2025"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-to-minio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka-to-minio
+  template:
+    metadata:
+      labels:
+        app: kafka-to-minio
+    spec:
+      containers:
+      - name: kafka-to-minio
+        image: your-registry/kafka-to-minio:latest  # Docker imajınız için registry ve tag'i değiştirin
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        envFrom:
+        - configMapRef:
+            name: kafka-to-minio-config
+        - secretRef:
+            name: kafka-to-minio-secrets
+        volumeMounts:
+        - name: kafka-truststore
+          mountPath: /tmp/Kafka_Connection
+      volumes:
+      - name: kafka-truststore
+        configMap:
+          name: kafka-truststore  # Bu ConfigMap oluşturulmalıdır
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-truststore
+data:
+  # kafka.broker.truststore.jks dosyanızı base64 kodlaması ile ekleyin
+  kafka.broker.truststore.jks: |
+    # Truststore dosyasının base64 kodlanmış içeriği buraya eklenmelidir
